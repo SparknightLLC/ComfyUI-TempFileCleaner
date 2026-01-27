@@ -4,6 +4,8 @@ An extension for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that delet
 
 Comfy automatically deletes the contents of your `temp` folder on startup, but if you amass a lot of files over the course of a session, it can degrade performance - particularly if any extensions, firewall software, etc. attempt to check the `temp` folder.
 
+<img width="400" alt="screenshot" src="https://github.com/user-attachments/assets/90a77aec-8003-4fc8-9872-3769a6ed9bbe" />
+
 ---
 
 ### age_limit (int)
