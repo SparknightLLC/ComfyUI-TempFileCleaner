@@ -18,7 +18,7 @@ How often to run the cleanup routine, in minutes.
 
 ### cleaning_paths (string)
 
-Comma-delimited list of relative folders to clean. Default: `temp`.
+Comma-delimited list of relative folders to clean. Note that it will **not** traverse the subfolders of each entry. Default: `temp`.
 
 Examples:
 
