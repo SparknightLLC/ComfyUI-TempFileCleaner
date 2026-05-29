@@ -12,7 +12,9 @@ const SETTING_IDS = {
 	max_files: "temp_file_cleaner.max_files",
 	enable_logging: "temp_file_cleaner.enable_logging",
 	trash_destination: "temp_file_cleaner.trash_destination",
-	cleaning_paths: "temp_file_cleaner.cleaning_paths"
+	cleaning_paths: "temp_file_cleaner.cleaning_paths",
+	whitelist: "temp_file_cleaner.whitelist",
+	blacklist: "temp_file_cleaner.blacklist"
 };
 
 const DEFAULT_SETTINGS = {
@@ -21,7 +23,9 @@ const DEFAULT_SETTINGS = {
 	max_files: 100,
 	enable_logging: true,
 	trash_destination: "",
-	cleaning_paths: "temp"
+	cleaning_paths: "temp",
+	whitelist: "",
+	blacklist: "bedroom.mp4,example_image.jpg,groceries.jpg,image.png"
 };
 
 function build_setting_category(label)
@@ -143,6 +147,44 @@ function normalize_cleaning_paths(value)
 		: DEFAULT_SETTINGS.cleaning_paths;
 }
 
+function normalize_file_name_list(value, fallback = "")
+{
+	if (typeof value !== "string")
+	{
+		return fallback;
+	}
+
+	const normalized_file_names = [];
+	const seen_file_names = new Set();
+
+	for (const raw_file_name of value.split(","))
+	{
+		const normalized_file_name = raw_file_name.trim();
+		if (!normalized_file_name || normalized_file_name === "." || normalized_file_name === "..")
+		{
+			continue;
+		}
+
+		if (normalized_file_name.includes("/") || normalized_file_name.includes("\\"))
+		{
+			continue;
+		}
+
+		const file_name_key = normalized_file_name.toLowerCase();
+		if (seen_file_names.has(file_name_key))
+		{
+			continue;
+		}
+
+		seen_file_names.add(file_name_key);
+		normalized_file_names.push(normalized_file_name);
+	}
+
+	return normalized_file_names.length > 0
+		? normalized_file_names.join(",")
+		: "";
+}
+
 function normalize_settings(raw_settings)
 {
 	return {
@@ -151,7 +193,9 @@ function normalize_settings(raw_settings)
 		max_files: normalize_integer(raw_settings?.max_files, DEFAULT_SETTINGS.max_files, 0),
 		enable_logging: normalize_boolean(raw_settings?.enable_logging, DEFAULT_SETTINGS.enable_logging),
 		trash_destination: normalize_string(raw_settings?.trash_destination, DEFAULT_SETTINGS.trash_destination),
-		cleaning_paths: normalize_cleaning_paths(raw_settings?.cleaning_paths)
+		cleaning_paths: normalize_cleaning_paths(raw_settings?.cleaning_paths),
+		whitelist: normalize_file_name_list(raw_settings?.whitelist, DEFAULT_SETTINGS.whitelist),
+		blacklist: normalize_file_name_list(raw_settings?.blacklist, DEFAULT_SETTINGS.blacklist)
 	};
 }
 
@@ -228,7 +272,9 @@ function read_ui_settings(settings_access, fallback_settings)
 		max_files: settings_access.get(SETTING_IDS.max_files, fallback_settings.max_files),
 		enable_logging: settings_access.get(SETTING_IDS.enable_logging, fallback_settings.enable_logging),
 		trash_destination: settings_access.get(SETTING_IDS.trash_destination, fallback_settings.trash_destination),
-		cleaning_paths: settings_access.get(SETTING_IDS.cleaning_paths, fallback_settings.cleaning_paths)
+		cleaning_paths: settings_access.get(SETTING_IDS.cleaning_paths, fallback_settings.cleaning_paths),
+		whitelist: settings_access.get(SETTING_IDS.whitelist, fallback_settings.whitelist),
+		blacklist: settings_access.get(SETTING_IDS.blacklist, fallback_settings.blacklist)
 	});
 }
 
@@ -353,6 +399,38 @@ app.registerExtension({
 				settings = await save_server_settings({
 					...settings,
 					cleaning_paths: normalize_cleaning_paths(new_value)
+				});
+			}
+		});
+
+		settings_access.add_setting({
+			id: SETTING_IDS.whitelist,
+			category: build_setting_category("Whitelist"),
+			name: "Only clean these filenames (comma-delimited; leave empty for all)",
+			type: "string",
+			attrs: { placeholder: "render.png,preview.webp" },
+			defaultValue: settings.whitelist,
+			onChange: async (new_value) =>
+			{
+				settings = await save_server_settings({
+					...settings,
+					whitelist: normalize_file_name_list(new_value)
+				});
+			}
+		});
+
+		settings_access.add_setting({
+			id: SETTING_IDS.blacklist,
+			category: build_setting_category("Blacklist"),
+			name: "Never clean these filenames (comma-delimited)",
+			type: "string",
+			attrs: { placeholder: DEFAULT_SETTINGS.blacklist },
+			defaultValue: settings.blacklist,
+			onChange: async (new_value) =>
+			{
+				settings = await save_server_settings({
+					...settings,
+					blacklist: normalize_file_name_list(new_value)
 				});
 			}
 		});

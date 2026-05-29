@@ -1,5 +1,7 @@
 # ComfyUI-TempFileCleaner
 
+<img width="600" alt="image" src="https://github.com/user-attachments/assets/4a34af5f-ca63-4998-9965-94908d4b37de" />
+
 An extension for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that deletes or moves files out of one or more relative folders such as `temp` or `input/pasted` to improve performance. Highly customizable.
 
 Comfy automatically deletes the contents of your `temp` folder on startup, but if you amass a lot of files over the course of a session, it can degrade performance - particularly if any extensions, firewall software, etc. attempt to check the `temp` folder.
@@ -16,12 +18,20 @@ How often to run the cleanup routine, in minutes.
 
 ### cleaning_paths (string)
 
-Comma-delimited list of relative folders to clean. Default: `temp`.
+Comma-delimited list of relative folders to clean. Note that it will **not** traverse the subfolders of each entry. Default: `temp`.
 
 Examples:
 
 - `temp`
 - `temp,input,input/pasted`
+
+### whitelist (string)
+
+Comma-delimited list of filenames to clean. Leave empty to allow every filename. If a whitelist is set, files not listed here will be ignored. Default: empty.
+
+### blacklist (string)
+
+Comma-delimited list of filenames that should never be cleaned. Blacklist entries take priority over whitelist entries. Default: `bedroom.mp4,example_image.jpg,groceries.jpg,image.png`.
 
 ### enable_logging (bool)
 

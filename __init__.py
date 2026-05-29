@@ -21,7 +21,9 @@ DEFAULT_CONFIG = {
 	"max_files": 100,
 	"enable_logging": True,
 	"trash_destination": "",
-	"cleaning_paths": "temp"
+	"cleaning_paths": "temp",
+	"whitelist": "",
+	"blacklist": "bedroom.mp4,example_image.jpg,groceries.jpg,image.png"
 }
 
 config_lock = threading.RLock()
@@ -103,6 +105,51 @@ def normalize_cleaning_paths(value):
 	return DEFAULT_CONFIG["cleaning_paths"]
 
 
+def split_file_names(file_names):
+	if not isinstance(file_names, str):
+		return []
+
+	normalized_file_names = []
+	seen_file_names = set()
+
+	for raw_file_name in file_names.split(","):
+		candidate_file_name = raw_file_name.strip()
+		if not candidate_file_name:
+			continue
+
+		if "/" in candidate_file_name or "\\" in candidate_file_name:
+			continue
+
+		normalized_file_name = os.path.basename(candidate_file_name)
+		if normalized_file_name in ("", ".", ".."):
+			continue
+
+		file_name_key = normalized_file_name.casefold()
+		if file_name_key not in seen_file_names:
+			seen_file_names.add(file_name_key)
+			normalized_file_names.append(normalized_file_name)
+
+	return normalized_file_names
+
+
+def normalize_file_name_list(value, fallback = ""):
+	if not isinstance(value, str):
+		return fallback
+
+	normalized_file_names = split_file_names(value)
+	if normalized_file_names:
+		return ",".join(normalized_file_names)
+
+	return ""
+
+
+def get_config_value(raw_config, key):
+	if key in raw_config:
+		return raw_config[key]
+
+	return DEFAULT_CONFIG[key]
+
+
 def normalize_config(raw_config):
 	normalized_config = dict(DEFAULT_CONFIG)
 	if not isinstance(raw_config, dict):
@@ -114,6 +161,8 @@ def normalize_config(raw_config):
 	normalized_config["enable_logging"] = normalize_boolean(raw_config.get("enable_logging"), DEFAULT_CONFIG["enable_logging"])
 	normalized_config["trash_destination"] = normalize_string(raw_config.get("trash_destination"), DEFAULT_CONFIG["trash_destination"])
 	normalized_config["cleaning_paths"] = normalize_cleaning_paths(raw_config.get("cleaning_paths"))
+	normalized_config["whitelist"] = normalize_file_name_list(get_config_value(raw_config, "whitelist"), DEFAULT_CONFIG["whitelist"])
+	normalized_config["blacklist"] = normalize_file_name_list(get_config_value(raw_config, "blacklist"), DEFAULT_CONFIG["blacklist"])
 	return normalized_config
 
 
@@ -273,12 +322,21 @@ def clean_file(file_path, current_config):
 
 def get_directory_files(target_directory, current_config):
 	files = []
+	whitelisted_file_names = set(file_name.casefold() for file_name in split_file_names(current_config["whitelist"]))
+	blacklisted_file_names = set(file_name.casefold() for file_name in split_file_names(current_config["blacklist"]))
 
 	try:
 		with os.scandir(target_directory) as entries:
 			for entry in entries:
 				try:
 					if not entry.is_file(follow_symlinks = False):
+						continue
+
+					file_name_key = entry.name.casefold()
+					if file_name_key in blacklisted_file_names:
+						continue
+
+					if whitelisted_file_names and file_name_key not in whitelisted_file_names:
 						continue
 
 					stat_result = entry.stat(follow_symlinks = False)
