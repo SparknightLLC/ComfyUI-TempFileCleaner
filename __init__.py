@@ -1,12 +1,19 @@
 import json
 import os
 import posixpath
+import struct
 import threading
 import time
+import zlib
 
 import folder_paths
 from aiohttp import web
 from server import PromptServer
+
+try:
+	from app.assets.services.asset_management import resolve_hash_to_path
+except ImportError:
+	resolve_hash_to_path = None
 
 EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
 LEGACY_CONFIG_PATH = os.path.join(EXTENSION_PATH, "config.json")
@@ -14,12 +21,32 @@ RUNTIME_CONFIG_DIRECTORY = folder_paths.get_system_user_directory("temp_file_cle
 RUNTIME_CONFIG_PATH = os.path.join(RUNTIME_CONFIG_DIRECTORY, "settings.json")
 BASE_DIRECTORY = os.path.abspath(folder_paths.base_path)
 LOG_PREFIX = "[TempFileCleaner]"
+PROTECTED_FILE_LEASE_SECONDS = 300
+MAX_PROTECTED_FILES_PER_CLIENT = 10000
+MAX_PROTECTED_FILE_REFERENCE_LENGTH = 4096
+PROTECTED_NODE_INPUTS = {
+	"LoadImage": "image",
+	"LoadImageMask": "image",
+	"LoadImageOutput": "image"
+}
+# Preview nodes are not protected from cleaning - the images they show are
+# temp files - but a row pointing at one that was cleaned is repaired the same
+# way, so the workflow still runs.
+REPAIRABLE_NODE_INPUTS = {
+	**PROTECTED_NODE_INPUTS,
+	"PreviewImage": "image"
+}
+PLACEHOLDER_FILE_NAME = "temp_file_cleaner_placeholder.png"
+PLACEHOLDER_SIZE = 16
+PLACEHOLDER_GRAY = 0x80
 
 DEFAULT_CONFIG = {
 	"age_limit": 120,
 	"check_frequency": 10,
 	"max_files": 100,
 	"enable_logging": True,
+	"protect_active_files": True,
+	"repair_missing_files": True,
 	"trash_destination": "",
 	"cleaning_paths": "temp",
 	"whitelist": "",
@@ -27,6 +54,8 @@ DEFAULT_CONFIG = {
 }
 
 config_lock = threading.RLock()
+protected_files_lock = threading.RLock()
+protected_files_by_client = {}
 
 
 def log_message(message, enabled = True):
@@ -159,6 +188,8 @@ def normalize_config(raw_config):
 	normalized_config["check_frequency"] = normalize_integer(raw_config.get("check_frequency"), DEFAULT_CONFIG["check_frequency"], minimum = 1)
 	normalized_config["max_files"] = normalize_integer(raw_config.get("max_files"), DEFAULT_CONFIG["max_files"], minimum = 0)
 	normalized_config["enable_logging"] = normalize_boolean(raw_config.get("enable_logging"), DEFAULT_CONFIG["enable_logging"])
+	normalized_config["protect_active_files"] = normalize_boolean(raw_config.get("protect_active_files"), DEFAULT_CONFIG["protect_active_files"])
+	normalized_config["repair_missing_files"] = normalize_boolean(raw_config.get("repair_missing_files"), DEFAULT_CONFIG["repair_missing_files"])
 	normalized_config["trash_destination"] = normalize_string(raw_config.get("trash_destination"), DEFAULT_CONFIG["trash_destination"])
 	normalized_config["cleaning_paths"] = normalize_cleaning_paths(raw_config.get("cleaning_paths"))
 	normalized_config["whitelist"] = normalize_file_name_list(get_config_value(raw_config, "whitelist"), DEFAULT_CONFIG["whitelist"])
@@ -211,6 +242,45 @@ def load_config():
 config = load_config()
 
 
+def build_placeholder_png(size = PLACEHOLDER_SIZE, gray = PLACEHOLDER_GRAY):
+	"""A flat gray PNG, built with the standard library so it ships as code."""
+	scanlines = b"".join(b"\x00" + bytes([gray]) * size for _ in range(size))
+
+	def chunk(tag, payload):
+		crc = zlib.crc32(tag + payload) & 0xffffffff
+		return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
+
+	header = struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0)
+	return (
+		b"\x89PNG\r\n\x1a\n"
+		+ chunk(b"IHDR", header)
+		+ chunk(b"IDAT", zlib.compress(scanlines, 9))
+		+ chunk(b"IEND", b"")
+	)
+
+
+def get_placeholder_image_path():
+	return os.path.join(folder_paths.get_input_directory(), PLACEHOLDER_FILE_NAME)
+
+
+def ensure_placeholder_image():
+	"""Keep the repair target on disk, and never let the cleaner take it."""
+	placeholder_path = get_placeholder_image_path()
+
+	try:
+		if os.path.isfile(placeholder_path):
+			return
+
+		os.makedirs(os.path.dirname(placeholder_path), exist_ok = True)
+		with open(placeholder_path, "wb") as placeholder_file:
+			placeholder_file.write(build_placeholder_png())
+	except OSError as error:
+		log_message(f"Unable to write '{placeholder_path}': {error}")
+
+
+ensure_placeholder_image()
+
+
 def get_config_snapshot():
 	with config_lock:
 		return dict(config)
@@ -256,6 +326,115 @@ async def set_settings(request):
 
 	updated_config = update_config(data)
 	return web.json_response({"status": "ok", "config": updated_config})
+
+
+def normalize_absolute_path(path):
+	return os.path.normcase(os.path.abspath(path))
+
+
+def normalize_protected_file_reference(file_reference, owner_id = ""):
+	if not isinstance(file_reference, str):
+		return None
+
+	file_reference = file_reference.strip()
+	if not file_reference or len(file_reference) > MAX_PROTECTED_FILE_REFERENCE_LENGTH:
+		return None
+
+	if file_reference.startswith("blake3:"):
+		if resolve_hash_to_path is None:
+			return None
+
+		resolved_file = resolve_hash_to_path(file_reference, owner_id = owner_id)
+		if resolved_file is None:
+			return None
+		file_path = resolved_file.abs_path
+	else:
+		try:
+			file_path = folder_paths.get_annotated_filepath(file_reference)
+		except (TypeError, ValueError):
+			return None
+
+	file_path = normalize_absolute_path(file_path)
+	try:
+		if os.path.commonpath([normalize_absolute_path(BASE_DIRECTORY), file_path]) != normalize_absolute_path(BASE_DIRECTORY):
+			return None
+	except ValueError:
+		return None
+
+	return file_path
+
+
+def update_client_protected_files(client_id, file_references, owner_id = ""):
+	protected_paths = set()
+	for file_reference in file_references:
+		protected_path = normalize_protected_file_reference(file_reference, owner_id)
+		if protected_path:
+			protected_paths.add(protected_path)
+
+	with protected_files_lock:
+		if protected_paths:
+			protected_files_by_client[client_id] = (time.monotonic(), protected_paths)
+		else:
+			protected_files_by_client.pop(client_id, None)
+
+
+def get_missing_file_references(file_references, owner_id = ""):
+	"""References that resolve to a location on disk but no longer exist."""
+	missing_references = []
+
+	for file_reference in file_references:
+		if not isinstance(file_reference, str):
+			continue
+
+		file_path = normalize_protected_file_reference(file_reference, owner_id)
+		if file_path is None or os.path.isfile(file_path):
+			continue
+
+		missing_references.append(file_reference.strip())
+
+	return missing_references
+
+
+@PromptServer.instance.routes.post("/temp_file_cleaner/missing-files")
+async def report_missing_files(request):
+	try:
+		body = await request.text()
+		data = json.loads(body) if body and body.strip() else None
+	except json.JSONDecodeError:
+		return web.json_response({"status": "error", "message": "Invalid JSON body."}, status = 400)
+
+	if not isinstance(data, dict):
+		return web.json_response({"status": "error", "message": "Missing files payload must be a JSON object."}, status = 400)
+
+	file_references = data.get("files")
+	if not isinstance(file_references, list) or len(file_references) > MAX_PROTECTED_FILES_PER_CLIENT:
+		return web.json_response({"status": "error", "message": "Invalid files list."}, status = 400)
+
+	owner_id = PromptServer.instance.user_manager.get_request_user_id(request)
+	return web.json_response({"status": "ok", "missing": get_missing_file_references(file_references, owner_id)})
+
+
+@PromptServer.instance.routes.post("/temp_file_cleaner/protected-files")
+async def set_protected_files(request):
+	try:
+		body = await request.text()
+		data = json.loads(body) if body and body.strip() else None
+	except json.JSONDecodeError:
+		return web.json_response({"status": "error", "message": "Invalid JSON body."}, status = 400)
+
+	if not isinstance(data, dict):
+		return web.json_response({"status": "error", "message": "Protected files payload must be a JSON object."}, status = 400)
+
+	client_id = data.get("client_id")
+	file_references = data.get("files")
+	if not isinstance(client_id, str) or not client_id.strip() or len(client_id) > 128:
+		return web.json_response({"status": "error", "message": "Invalid client id."}, status = 400)
+	if not isinstance(file_references, list) or len(file_references) > MAX_PROTECTED_FILES_PER_CLIENT:
+		return web.json_response({"status": "error", "message": "Invalid protected files list."}, status = 400)
+
+	owner_id = PromptServer.instance.user_manager.get_request_user_id(request)
+	update_client_protected_files(client_id.strip(), file_references, owner_id)
+	return web.json_response({"status": "ok"})
 
 
 def resolve_relative_directory(relative_path):
@@ -320,7 +499,69 @@ def clean_file(file_path, current_config):
 			log_message(f"Error deleting '{file_path}': {error}", current_config["enable_logging"])
 
 
-def get_directory_files(target_directory, current_config):
+def get_prompt_file_references(prompt):
+	file_references = []
+	if not isinstance(prompt, dict):
+		return file_references
+
+	for node_data in prompt.values():
+		if not isinstance(node_data, dict):
+			continue
+
+		input_name = PROTECTED_NODE_INPUTS.get(node_data.get("class_type"))
+		inputs = node_data.get("inputs")
+		if not input_name or not isinstance(inputs, dict):
+			continue
+
+		input_value = inputs.get(input_name)
+		if isinstance(input_value, str):
+			file_references.append(input_value)
+		elif isinstance(input_value, list) and all(isinstance(value, str) for value in input_value):
+			file_references.extend(input_value)
+
+	return file_references
+
+
+def get_queue_protected_paths():
+	protected_paths = set()
+	running_items, queued_items = PromptServer.instance.prompt_queue.get_current_queue_volatile()
+
+	for queue_item in running_items + queued_items:
+		if len(queue_item) < 3:
+			continue
+
+		for file_reference in get_prompt_file_references(queue_item[2]):
+			protected_path = normalize_protected_file_reference(file_reference)
+			if protected_path:
+				protected_paths.add(protected_path)
+
+	return protected_paths
+
+
+def get_protected_paths(current_config):
+	if not current_config["protect_active_files"]:
+		return set()
+
+	now = time.monotonic()
+	protected_paths = set()
+
+	with protected_files_lock:
+		expired_client_ids = []
+		for client_id, (updated_at, client_paths) in protected_files_by_client.items():
+			if (now - updated_at) > PROTECTED_FILE_LEASE_SECONDS:
+				expired_client_ids.append(client_id)
+				continue
+
+			protected_paths.update(client_paths)
+
+		for client_id in expired_client_ids:
+			protected_files_by_client.pop(client_id, None)
+
+	protected_paths.update(get_queue_protected_paths())
+	return protected_paths
+
+
+def get_directory_files(target_directory, current_config, protected_paths):
 	files = []
 	whitelisted_file_names = set(file_name.casefold() for file_name in split_file_names(current_config["whitelist"]))
 	blacklisted_file_names = set(file_name.casefold() for file_name in split_file_names(current_config["blacklist"]))
@@ -331,9 +572,14 @@ def get_directory_files(target_directory, current_config):
 				try:
 					if not entry.is_file(follow_symlinks = False):
 						continue
+					if normalize_absolute_path(entry.path) in protected_paths:
+						continue
 
 					file_name_key = entry.name.casefold()
 					if file_name_key in blacklisted_file_names:
+						continue
+
+					if file_name_key == PLACEHOLDER_FILE_NAME.casefold():
 						continue
 
 					if whitelisted_file_names and file_name_key not in whitelisted_file_names:
@@ -349,13 +595,13 @@ def get_directory_files(target_directory, current_config):
 	return files
 
 
-def clean_directory(relative_path, target_directory, current_config):
+def clean_directory(relative_path, target_directory, current_config, protected_paths):
 	if not os.path.isdir(target_directory):
 		log_message(f"Directory does not exist, skipping '{relative_path}': {target_directory}", current_config["enable_logging"])
 		return
 
 	now = time.time()
-	files = get_directory_files(target_directory, current_config)
+	files = get_directory_files(target_directory, current_config, protected_paths)
 
 	if current_config["age_limit"] > 0:
 		max_file_age = current_config["age_limit"] * 60
@@ -379,6 +625,7 @@ def run_cleanup_cycle(current_config):
 		return
 
 	log_message(f"Running cleanup for: {', '.join(target_paths)}", current_config["enable_logging"])
+	protected_paths = get_protected_paths(current_config)
 
 	for relative_path in target_paths:
 		target_directory = resolve_relative_directory(relative_path)
@@ -386,7 +633,7 @@ def run_cleanup_cycle(current_config):
 			log_message(f"Skipping invalid relative path: {relative_path}", current_config["enable_logging"])
 			continue
 
-		clean_directory(relative_path, target_directory, current_config)
+		clean_directory(relative_path, target_directory, current_config, protected_paths)
 
 
 def cleanup_loop():
